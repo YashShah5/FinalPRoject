@@ -1,4 +1,11 @@
 from TCP_socket_p2 import TCP_Connection
+from TCP_socket_p2 import TCP_Segment
+from typing import List
+from threading import current_thread
+
+# global var for solving double send in RTO test
+g_reTran = False
+
 
 class TCP_Connection_Final(TCP_Connection):
 	"""docstring for TCP_Connection_Final"""
@@ -6,87 +13,237 @@ class TCP_Connection_Final(TCP_Connection):
 		super().__init__(self_address, dst_address, self_seq_num, dst_seq_num, log_file)
 	def handle_timeout(self):
 		#put code to handle RTO timeout here
-		#send a single packet containing the oldest unacknowledged data
-		#increase the RTO timer 
-		# -----------------------
-		# Task 3: Resend one packet containing the oldest unacknowledged data
-		# Increase the RTO timer
-		if self.unacked_packets:
-			oldest_unacked_seq = self.unacked_packets[0][0]
-			self._packetize_and_send(oldest_unacked_seq, b'')
-			self.rto_timer *= 2
+		# send a single packet containing the oldest unacknowledged data
+		allow_send_len = min(self.SND.MSS, self.SND.WND, self.congestion_window, len(self.send_buff))
+		if allow_send_len <= 0:
+			return
 
+		# fix double send problem
+		# cannot handle special case, which the retransmission packet cause a zero window probing
+		# print(current_thread().ident, "handle_timeout allow_send_len:", allow_send_len)
+		# self.window_timer.stop_timer()
+		# another approach to fix double send problem in RTO test, this one should handle special case above FIXED!
+		global g_reTran
+		g_reTran = True
+
+		# set PSH
+		PSH_FLAG = False
+		# data = self.send_buff[:allow_send_len]
+		data = []
+		for i in range(allow_send_len):
+			if isinstance(self.send_buff[i], bytes):
+				PSH_FLAG = True
+				data.append(self.send_buff[i][0])
+			else:
+				data.append(self.send_buff[i])
+		
+		# print(self.SND.UNA, PSH_FLAG)
+		# print("data:", data)
+		
+
+		# retransmission
+		# This data is not empty, could be mistake    ->   nvm, returned above FIXED!
+		self._packetize_and_send(self.SND.UNA, PSH_FLAG, bytes(data))
+		
+		# save last packet for window timeout
+		self.last_packet[:]= [self.SND.UNA, PSH_FLAG, bytes(data)]
+
+		# fix double sent problem
+		# if not data:
+		# print(current_thread().ident, "start window timer")
+		# if not self.RTO_timer.check_time() <= 2:
+		# 	if not self.window_timer.is_runnning:
+		# 		self.window_timer.set_and_start(1)
+
+		# increase the RTO timer 
+		self.RTO_timer.set_and_start(self.RTO_timer.timer_length * 2)
+
+		pass
 	def handle_window_timeout(self):
 		#put code to handle window timeout here
 		#in other words, if we haven't sent any data in while (which causes this time to go off),
 		#send an empty packet
-		# -----------------------
-		# Task 7: Send an empty packet when the window timer goes off
-		if self.last_sent_seq is not None:
-			self._packetize_and_send(self.last_sent_seq, b'')
+		# another approach to fix double send problem in RTO test
+		global g_reTran
+		if not g_reTran:
+			# print(current_thread().ident, "handle_window_timeout allow_send_len:", self.last_packet[0])
+			self._packetize_and_send(self.last_packet[0], self.last_packet[1], self.last_packet[2])
 
-	def receive_packets(self, packets):
+		self.window_timer.set_and_start(self.window_timer.timer_length * 2)
+		pass
+	def receive_packets(self, packets: List[TCP_Segment]):
 		#insert code to deal with a list of incoming packets here
 		#NOTE: this code can send one packet, but should never send more than one packet
-		# -----------------------
-		# Task 1: Receive packets and store them in the receive buffer correctly
-		# Task 2a: Set the RTT timer if new data is sent and the timer is not running
-		# Task 2b: Update the RTT measurement when sent data is acknowledged and use it for RTO updates
-		# Task 4: Update SND.WND when a new window measurement comes in
-		# Task 5b: Mark a byte with PSH in the receive buffer if the packet has the PSH flag set
-		# Task 6: Send appropriate acknowledgments when new data is received
-		#         and update the next expected byte (RCV.NXT) when necessary
+
+		# print("receive_packets:", len(packets))
+		if len(packets) == 0:
+			return
+
+		# 100 101 None Non None None None
+		# [105 106 107 108]
+		recv_new_bytes = False
+		for i in range(len(packets)):
+
+			# RFC9293 p56
+			# The check here prevents using old segments to update the window.
+			# self.SND.WND = packets[i].WND
+			
+			if packets[i].ACK >= self.SND.UNA and packets[i].ACK <= self.SND.NXT:
+				if self.SND.WL1 < packets[i].SEQ or (self.SND.WL1 == packets[i].SEQ and self.SND.WL2 <= packets[i].ACK):
+					self.SND.WND = packets[i].WND
+					self.SND.WL1 = packets[i].SEQ
+					self.SND.WL2 = packets[i].ACK
+				else:
+					# print("bad packet: ", packets[i].SEQ, self.SND.WL1, self.SND.WL2)
+					continue
+			else:
+				# print("bad packet: ", packets[i].ACK, self.SND.UNA, self.SND.NXT)
+				continue
+
+			if len(packets[i].data) > 0:
+				recv_new_bytes = True
+
+			# save left bytes according to the current recv window
+			# spare_bytes = self.RCV.WND - (packets[i].SEQ - self.receive_buffer_start_seq)
+			spare_bytes = len(self.receive_buffer) - (packets[i].SEQ - self.receive_buffer_start_seq)
+			if spare_bytes == 0:
+				# print(current_thread().ident, "spare_bytes 0: ", packets[i].SEQ, self.receive_buffer_start_seq)
+				recv_new_bytes = True
+				break
+			# print(current_thread().ident, "recv info: ", len(self.receive_buffer), spare_bytes, self.RCV.WND, self.receive_buffer_start_seq)
+			if spare_bytes < len(packets[i].data):
+				packets[i].data = packets[i].data[0:spare_bytes]
+			
+			# copy bytes to recv buffer
+			for j in range(len(packets[i].data)):
+				self.receive_buffer[packets[i].SEQ - self.receive_buffer_start_seq + j] = packets[i].data[j]
+			# check PSH flag
+			if packets[i].flags.PSH:
+				self.receive_buffer[packets[i].SEQ - self.receive_buffer_start_seq + len(packets[i].data) - 1] = bytes([packets[i].data[-1]] + list(b'PSH'))
+
+			# When an ACK is received that acknowledges new data, restart the retransmission timer [rfc6928 5.3]
+			if packets[i].ACK:
+				# print(current_thread().ident, " recv ack: ", packets[i].SEQ + len(packets[i].data), self.RCV.NXT)
+				if packets[i].SEQ + len(packets[i].data) >= self.RCV.NXT:
+					self.RTO_timer.reset_timer()
+					# print(current_thread().ident, "recv new ack reset_timer ")
+
+			# recv new bytes
+			if packets[i].SEQ + len(packets[i].data) > self.RCV.NXT:
+				recv_new_bytes = True
+
+
+			# update SND.UNA by received ACK
+			# [100, None, None, 103, None]
+			# [101, 102]
+			# [104]
+			# newAck = False
+			if packets[i].ACK > self.SND.UNA:
+				# delete una buffer
+				# print(current_thread().ident, "recv ack update send_buff: ", packets[i].ACK, self.SND.UNA)
+				self.send_buff = self.send_buff[packets[i].ACK - self.SND.UNA:]
+				# update una
+				self.SND.UNA = packets[i].ACK
+				# newAck = True
+			else:
+				# print(current_thread().ident, "recv repeated ack: ", packets[i].ACK, self.SND.UNA)
+				pass
+			
+			# check zero probing window
+			# if newAck:
+			if packets[i].WND <= 0:
+				if not self.window_timer.is_runnning():
+					# print("not start when recv 0 window")
+					# print(current_thread().ident, "start window timer")
+					# self.window_timer.set_and_start(1)
+					pass
+			else:
+				if self.window_timer.is_runnning():
+					# print(current_thread().ident, "recv window > 0 stop window timer")
+					self.window_timer.stop_timer()
+			# update RTT
+
+
+		# update RCV.NXT which is the seq of the first 'None' in the 'receive_buffer'
+		# print("self.receive_buffer len: ", len(self.receive_buffer))
+		seeNone = False
+		for i in range(len(self.receive_buffer)):
+			if self.receive_buffer[i] == None:
+				self.RCV.NXT = i + self.receive_buffer_start_seq
+				seeNone = True
+				break
+		if not seeNone:
+			self.RCV.NXT = self.receive_buffer_start_seq + len(self.receive_buffer)
+			# print(current_thread().ident, "we have full receive_buffer:", self.RCV.NXT, self.receive_buffer_start_seq, len(self.receive_buffer))
+
+		# update RCV.WND
+		# delete 8192 use name
+		self.RCV.WND = len(self.receive_buffer) - (self.RCV.NXT - self.receive_buffer_start_seq)
 		
-		for packet in packets:
-			seq_num, data, flags = packet
-			self.receive_buffer[seq_num - self.receive_buffer_start_seq] = (data, flags)
-			if self.receiving_ack_num is None or self.receiving_ack_num < seq_num:
-				self.receiving_ack_num = seq_num
-				
-			if b'PSH' in flags:
-				self.push_flag_set = True
-				
-			if seq_num == self.next_expected_seq_num:
-				self.next_expected_seq_num += len(data)
-				
-			# Send appropriate acknowledgments
-			if self.push_flag_set or b'ACK' in flags or len(data) == 0:
-				self._send_acknowledgment()
+		# print(current_thread().ident, "self.receive NXT start_seq self.RCV.WND : ", self.RCV.NXT, self.receive_buffer_start_seq, self.RCV.WND)
+		
+		# send ACK
+		if recv_new_bytes:
+			self._packetize_and_send(seq=self.SND.UNA)
+
+			# close RTO timer when we recv all acks for sent data [rfc6298 5.2]
+			if self.SND.UNA >= self.SND.NXT:
+				self.RTO_timer.stop_timer()
+				# retransmission ends
+				# print("Can I reach here?")
+				global g_reTran
+				g_reTran = False
+
+
+		pass
 	def send_data(self, window_timeout = False, RTO_timeout = False):
 		#put code to send a single packet of data here
 		#note that this code does not always need to send data, only if TCP policy thinks it makes sense
 		#if there is any data to send, i.e. we have data we have not sent and we are allowed to send by our
 		#congestion and flow control windows, then send one packet of that data
-		# -----------------------
-		# Task 0: Send packets with the largest allowed size based on 3 factors
-		# Task 2: Update the congestion control window based on RFC
-		# Task 2a: Set the RTT timer if new data is sent and the timer is not running
-		# Task 2b: Update the RTT measurement when sent data is acknowledged and use it for RTO updates
-		# Task 4: Ensure not to send more data than the flow control window
-		# Task 5a: Set the push flag whenever at least one byte is marked PSH in the data to be sent
-		# Task 7: Restart the window timer whenever data is sent, including retransmissions
 		
-		# Get the maximum packet size allowed based on 3 factors
-		max_packet_size = min(self.SND.MSS, self.SND.WND, self.congestion_window)
+		allow_send_len = min(self.SND.MSS, self.SND.WND, self.congestion_window, len(self.send_buff) - (self.SND.NXT - self.SND.UNA))
+		if allow_send_len <= 0:
+			return
+
+		if self.SND.NXT >= self.SND.UNA + self.SND.WND:
+			# exit()
+			# print("no bytes with sequence numbers greater than SND.UNA + SND.WND should ever be sent: ", self.SND.NXT, self.SND.UNA, self.SND.WND)
+			return
+
+		# print(current_thread().ident, "allow_send_len:", allow_send_len, self.SND.NXT, self.SND.UNA, self.SND.WND)
+
+		# set PSH
+		PSH_FLAG = False
+		# data = self.send_buff[:allow_send_len]
+		data = []
+		for i in range(allow_send_len):
+			if isinstance(self.send_buff[self.SND.NXT - self.SND.UNA + i], bytes):
+				PSH_FLAG = True
+				data.append(self.send_buff[self.SND.NXT - self.SND.UNA + i][0])
+			else:
+				data.append(self.send_buff[self.SND.NXT - self.SND.UNA + i])
 		
-		if RTO_timeout:
-			# If RTO timeout, resend the oldest unacknowledged packet
-			if self.unacked_packets:
-				oldest_unacked_seq = self.unacked_packets[0][0]
-				self._packetize_and_send(oldest_unacked_seq, b'')
-				self.rto_timer *= 2
-		else:
-			if not window_timeout and max_packet_size > 0:
-				# If not window timeout and there is data to send, send one packet of data
-				data_to_send = self.send_buffer[:max_packet_size]
-				self.send_buffer = self.send_buffer[max_packet_size:]
-				self._packetize_and_send(self.snd_nxt, data_to_send)
-				self.snd_nxt += len(data_to_send)
-				
-				if len(data_to_send) > 0:
-					# Restart the window timer whenever data is sent, including retransmissions
-					self.window_timer = self.rto_timer
-					
-				if self.snd_nxt == self.snd_una:
-					# Set the RTT timer if new data is sent and the timer is not running 
-					self._set_rtt_timer()
+		# print(self.SND.NXT, PSH_FLAG)
+		# print("data:", data)
+
+		
+		self._packetize_and_send(self.SND.NXT, PSH_FLAG, bytes(data))
+		
+		# save last packet for window timeout
+		self.last_packet[:]= [self.SND.NXT, PSH_FLAG, bytes(data)]
+
+
+		# check RTO timer
+		if not self.RTO_timer.is_runnning():
+			self.RTO_timer.set_and_start(1)
+
+		if not self.window_timer.is_runnning():
+			# print(current_thread().ident, "start window timer")
+			self.window_timer.set_and_start(1)
+
+		# self._packetize_and_send(self.last_packet[0], self.last_packet[1], self.last_packet[2])
+
+		self.SND.NXT = self.SND.NXT + allow_send_len
+
+		pass
